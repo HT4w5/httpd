@@ -1,7 +1,11 @@
-#include <string>
+#include <cstring>
 #include <stdexcept>
+#include <fstream>
 
 #include "libhttp.hpp"
+
+#define MAX_REQUEST_SIZE 1024 * 1024 * 10
+#define MAX_HEADER_SIZE 1024 * 1024 * 10
 
 using namespace std;
 
@@ -20,6 +24,12 @@ http_request_handler::~http_request_handler()
 
 void http_request_handler::parse()
 {
-    // TODO: Implement this method.
-    // With FILE* stream or with syscall?
+}
+
+char *http_request_handler::read_to_buffer()
+{
+    char *read_buffer=(char*)malloc(sizeof(char)*MAX_REQUEST_SIZE);
+
+    //
+
 }
