@@ -4,12 +4,14 @@
 #include <cstring>
 #include <stdexcept>
 #include <fstream>
+#include <unistd.h>
 
 using namespace std;
 
 class http_request_handler
 {
 public:
+    size_t request_size;
     char *method;
     char *url;
     char *version;
@@ -21,8 +23,8 @@ public:
 
 private:
     int socket_fd;
-    char *read_to_buffer();
-    void fatal_error();
+    void fatal_error(const string &message);
+    size_t read_from_socket(int fd, char *buffer, size_t size);
 };
 
 #endif

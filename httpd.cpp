@@ -6,7 +6,15 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <cstdio>
+#include <cstdlib>
 using namespace std;
+
+/******************************
+* TODO:
+* Reimplement multithreading with c++ threads.
+* Refactor error handing with exceptions.
+******************************/
 
 // Server properties.
 string server_dir = "";
@@ -27,12 +35,12 @@ void error_die(const string &msg)
     exit(1);
 }
 
-void handle_file_request(void *client_fd)
+void *handle_file_request(void *client_fd)
 {
     // TODO: Implement file request handling.
 }
 
-void handle_proxy_request(void *client_fd)
+void *handle_proxy_request(void *client_fd)
 {
     // TODO: Implement proxy request handling.
 }
