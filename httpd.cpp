@@ -8,13 +8,16 @@
 #include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
+
+#include "libhttp.hpp"
+
 using namespace std;
 
 /******************************
-* TODO:
-* Reimplement multithreading with c++ threads.
-* Refactor error handing with exceptions.
-******************************/
+ * TODO:
+ * Reimplement multithreading with c++ threads.
+ * Refactor error handing with exceptions.
+ ******************************/
 
 // Server properties.
 string server_dir = "";
@@ -38,6 +41,9 @@ void error_die(const string &msg)
 void *handle_file_request(void *client_fd)
 {
     // TODO: Implement file request handling.
+    http_request file_request(*(int *)client_fd);
+    file_request.parse();
+
 }
 
 void *handle_proxy_request(void *client_fd)
