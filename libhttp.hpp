@@ -36,6 +36,7 @@ public:
     ~http_response();
     void send();
     void set_status(int status);
+    void set_path(const char *path);
     void append_header(const char *name, const char *value);
 
 private:
@@ -49,18 +50,18 @@ private:
 
     int socket_fd;
     int status;
-    size_t content_size;
 
     char *path;
     char *version;
     http_header_t *headers;
-    char *body;
 
     http_header_t *create_header();
     char *get_reason_phrase(int status);
     void send_status_line();
     void send_headers();
-    void send_body();
+    void end_headers();
+    void send_file();
+    void send_buff(const char *);
 };
 
 #endif

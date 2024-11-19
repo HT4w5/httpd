@@ -2,12 +2,18 @@
 #include <stdexcept>
 #include <fstream>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <errno.h>
+#include <iostream>
+#include <sstream>
 
 #include "libhttp.hpp"
 
 #define LIBHTTP_MAX_REQUEST_SIZE 1024 * 1024 * 10
 #define LIBHTTP_MAX_HEADER_SIZE 1024 * 1024 * 10
+
+#define LIBHTTP_WRITE_BUFFER_SIZE 4096
 
 #define LIBHTTP_HTTP_VERSION "HTTP/1.0"
 
@@ -49,8 +55,9 @@ void http_request::fatal_error(const string &message)
 size_t http_request::read_from_socket(int fd, char *buffer, size_t size)
 {
     // Make sure read finishes
-    size_t bytes_read = 0;
-    size_t total_bytes_read = 0;
+    stringstream err_msg;
+    ssize_t bytes_read = 0;
+    ssize_t total_bytes_read = 0;
     char *read_ptr = buffer;
     while (total_bytes_read < size)
     {
@@ -59,7 +66,8 @@ size_t http_request::read_from_socket(int fd, char *buffer, size_t size)
         {
             if (bytes_read < 0)
             {
-                perror("Error reading from socket");
+                err_msg << "Error reading from socket: " << this->socket_fd << " (" << strerror(errno) << ")" << endl;
+                throw runtime_error(err_msg.str());
             }
             // Reached EOF.
             break;
@@ -74,7 +82,11 @@ size_t http_request::read_from_socket(int fd, char *buffer, size_t size)
 void http_request::parse()
 {
     // Read request into buffer.
-    char *read_buffer = (char *)malloc(sizeof(char) * (LIBHTTP_MAX_HEADER_SIZE));
+    char *read_buffer;
+    if ((read_buffer = (char *)malloc(sizeof(char) * (LIBHTTP_MAX_HEADER_SIZE))) < 0)
+    {
+        throw bad_alloc();
+    }
     read_from_socket(this->socket_fd, read_buffer, LIBHTTP_MAX_REQUEST_SIZE);
 
     // Parse request.
@@ -93,7 +105,7 @@ void http_request::parse()
     if (read_size == 0)
     {
         free(read_buffer);
-        fatal_error("Invalid HTTP request");
+        fatal_error("Invalid HTTP request"); //TODO: send bad request.
     }
     this->method = (char *)malloc(read_size + 1);
     memcpy(this->method, sp, read_size);
@@ -170,18 +182,23 @@ http_response::http_response(int socket_fd)
     this->socket_fd = socket_fd;
     this->headers = NULL;
     this->path = NULL;
-    this->body = NULL;
     this->version = LIBHTTP_HTTP_VERSION;
     this->status = 0;
 }
 
 http_response::~http_response()
 {
+    free(this->path);
+    // TODO: free headers stack.
 }
 
 http_response::http_header_t *http_response::create_header()
 {
     http_header_t *new_header = (http_header_t *)malloc(sizeof(http_header_t));
+    if (new_header == NULL)
+    {
+        throw bad_alloc();
+    }
     memset(new_header, 0, sizeof(http_header_t));
     return new_header;
 }
@@ -193,9 +210,17 @@ void http_response::append_header(const char *name, const char *value)
     name_len = strlen(name);
     value_len = strlen(value);
 
-    http_header_t *new_header = create_header();
-    new_header->name = (char *)malloc(name_len + 1);
-    new_header->value = (char *)malloc(value_len + 1);
+    http_header_t *new_header;
+    new_header = create_header();
+
+    if ((new_header->name = (char *)malloc(name_len + 1)) < 0)
+    {
+        throw bad_alloc();
+    }
+    if ((new_header->value = (char *)malloc(value_len + 1)) < 0)
+    {
+        throw bad_alloc();
+    }
 
     strcpy(new_header->name, name);
     strcpy(new_header->value, value);
@@ -246,17 +271,143 @@ void http_response::send_status_line()
     {
         throw invalid_argument("Status code not set");
     }
-    dprintf(this->socket_fd, "%s %d %s\r\n", this->version, this->status, get_reason_phrase(this->status));
-}
-
-void http_response::send_headers()
-{
-    while (this->headers != NULL)
+    if (dprintf(this->socket_fd, "%s %d %s\r\n", this->version, this->status, get_reason_phrase(this->status)) < 0)
     {
-        
+        throw runtime_error("Send status line failed");
     }
 }
 
+// Send header fields and values to socket fd.
+// Headers are stored in stack and sent LIFO.
+// Doesn't do anything if stack is empty.
+void http_response::send_headers()
+{
+    http_header_t *current = NULL;
+    while (this->headers != NULL)
+    {
+        // Check header presence.
+        if (this->headers->name == NULL || this->headers->value == NULL)
+        {
+            throw invalid_argument("Invalid header");
+        }
+        // Send header line.
+        if (dprintf(this->socket_fd, "%s: %s\r\n", this->headers->name, this->headers->value) < 0)
+        {
+            throw runtime_error("Send header failed");
+        }
+
+        // Pop stack.
+        current = this->headers;
+        this->headers = this->headers->next;
+        free(current);
+    }
+}
+
+void http_response::end_headers()
+{
+    if (dprintf(this->socket_fd, "\r\n") < 0)
+    {
+        throw runtime_error("Send header failed");
+    }
+}
+
+// Open fd from this.path and send copy content to socket fd.
+// Only send file content, headers should be handled before invoke.
+// Assuming the path leads to a valid file.
+void http_response::send_file()
+{
+    // Get file descriptor.
+    stringstream err_msg;
+    int file_fd = open(this->path, O_RDONLY, S_IRUSR);
+    if (file_fd < 0)
+    {
+        err_msg << "Error opening file: " << this->path << " (" << strerror(errno) << ")" << endl;
+        throw runtime_error(err_msg.str());
+    }
+
+    // Write to socket.
+    char write_buffer[LIBHTTP_WRITE_BUFFER_SIZE];
+    char *write_buffer_ptr = NULL;
+    ssize_t n_buffered, n_written;
+
+    while (1)
+    {
+        // Repeatedly read and write until EOF.
+        n_buffered = read(file_fd, write_buffer, LIBHTTP_WRITE_BUFFER_SIZE);
+        if (n_buffered < 0)
+        {
+            err_msg.str("");
+            err_msg << "Error reading from file: " << this->path << strerror(errno) << endl;
+            throw runtime_error(err_msg.str());
+        }
+        else if (n_buffered == 0)
+        {
+            // EOF reached.
+            break;
+        }
+
+        // Repeatedly write to guarantee completion.
+        // Reset pointer pos.
+        write_buffer_ptr = write_buffer;
+
+        while (n_buffered > 0)
+        {
+            n_written = write(this->socket_fd, write_buffer_ptr, n_buffered);
+            if (n_written < 0)
+            {
+                err_msg.str("");
+                err_msg << "Error writing to socket: " << this->socket_fd << strerror(errno) << endl;
+                throw runtime_error(err_msg.str());
+            }
+            n_buffered -= n_written;
+            write_buffer_ptr += n_written;
+        }
+    }
+}
+
+void http_response::send_buff(const char *)
+{
+}
+
+// Copy path to this->path.
+// Does not validate path.
+// format: "path/to/file".
+void http_response::set_path(const char *path)
+{
+    size_t path_len;
+    path_len = strlen(path);
+    if ((this->path = (char *)malloc(path_len + 1)) < 0)
+    {
+        throw bad_alloc();
+    }
+    strcpy(this->path, path);
+}
+
+// Only support sending files and file lists for now.
+// Assumes path is correct in format, and file exists.
+// format: "path/to/file".
 void http_response::send()
 {
+    try
+    {
+        send_status_line();
+        send_headers();
+        end_headers();
+        send_file();
+    }
+    catch (const runtime_error &e)
+    {
+        cerr << "Runtime error caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+    catch (const invalid_argument &e)
+    {
+        cerr << "Invalid argument caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+    catch (const exception &e)
+    {
+        cerr << "Unknown error caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
 }
