@@ -7,6 +7,9 @@
 #include <errno.h>
 #include <iostream>
 #include <sstream>
+#include <filesystem>
+#include <ctime>
+#include <iomanip>
 
 #include "libhttp.hpp"
 
@@ -15,9 +18,11 @@
 
 #define LIBHTTP_WRITE_BUFFER_SIZE 4096
 
-#define LIBHTTP_HTTP_VERSION "HTTP/1.0"
+#define LIBHTTP_HTTP_VERSION "HTTP/1.1"
+#define LIBHTTP_HTTP_SERVER_STRING "HTTPD/0.0.1"
 
 using namespace std;
+namespace fs = filesystem;
 
 /****************
  * http_request *
@@ -55,7 +60,7 @@ void http_request::fatal_error(const string &message)
 size_t http_request::read_from_socket(int fd, char *buffer, size_t size)
 {
     // Make sure read finishes
-    stringstream err_msg;
+    ostringstream err_msg;
     ssize_t bytes_read = 0;
     ssize_t total_bytes_read = 0;
     char *read_ptr = buffer;
@@ -83,7 +88,7 @@ void http_request::parse()
 {
     // Read request into buffer.
     char *read_buffer;
-    if ((read_buffer = (char *)malloc(sizeof(char) * (LIBHTTP_MAX_HEADER_SIZE))) < 0)
+    if ((read_buffer = (char *)malloc(sizeof(char) * (LIBHTTP_MAX_HEADER_SIZE))) == NULL)
     {
         throw bad_alloc();
     }
@@ -105,7 +110,7 @@ void http_request::parse()
     if (read_size == 0)
     {
         free(read_buffer);
-        fatal_error("Invalid HTTP request"); //TODO: send bad request.
+        throw invalid_argument("Bad HTTP request");
     }
     this->method = (char *)malloc(read_size + 1);
     memcpy(this->method, sp, read_size);
@@ -117,7 +122,7 @@ void http_request::parse()
     if (*fp != ' ')
     {
         free(read_buffer);
-        fatal_error("Invalid HTTP request");
+        throw invalid_argument("Bad HTTP request");
     }
 
     // Get request path.
@@ -130,7 +135,7 @@ void http_request::parse()
     if (read_size == 0)
     {
         free(read_buffer);
-        fatal_error("Invalid HTTP request");
+        throw invalid_argument("Bad HTTP request");
     }
     this->path = (char *)malloc(read_size + 1);
     memcpy(this->path, sp, read_size);
@@ -142,7 +147,7 @@ void http_request::parse()
     if (*fp != ' ')
     {
         free(read_buffer);
-        fatal_error("Invalid HTTP request");
+        throw invalid_argument("Bad HTTP request");
     }
 
     // Get HTTP version.
@@ -155,7 +160,7 @@ void http_request::parse()
     if (read_size == 0)
     {
         free(read_buffer);
-        fatal_error("Invalid HTTP request");
+        throw invalid_argument("Bad HTTP request");
     }
     this->version = (char *)malloc(read_size + 1);
     memcpy(this->version, sp, read_size);
@@ -180,8 +185,10 @@ http_response::http_response(int socket_fd)
         throw invalid_argument("Invalid socket file descriptor");
     }
     this->socket_fd = socket_fd;
-    this->headers = NULL;
+    this->header_queue_head = NULL;
+    this->header_queue_tail = NULL;
     this->path = NULL;
+    this->str = NULL;
     this->version = LIBHTTP_HTTP_VERSION;
     this->status = 0;
 }
@@ -189,7 +196,14 @@ http_response::http_response(int socket_fd)
 http_response::~http_response()
 {
     free(this->path);
-    // TODO: free headers stack.
+    // Free headers queue.
+    http_header_t *current = NULL;
+    while (this->header_queue_tail != NULL)
+    {
+        current = this->header_queue_tail;
+        this->header_queue_tail = this->header_queue_tail->next;
+        free(current);
+    }
 }
 
 http_response::http_header_t *http_response::create_header()
@@ -203,7 +217,7 @@ http_response::http_header_t *http_response::create_header()
     return new_header;
 }
 
-void http_response::append_header(const char *name, const char *value)
+void http_response::push_header(const char *name, const char *value)
 {
     // Allocate memory and copy value.
     size_t name_len, value_len;
@@ -213,11 +227,11 @@ void http_response::append_header(const char *name, const char *value)
     http_header_t *new_header;
     new_header = create_header();
 
-    if ((new_header->name = (char *)malloc(name_len + 1)) < 0)
+    if ((new_header->name = (char *)malloc(name_len + 1)) == NULL)
     {
         throw bad_alloc();
     }
-    if ((new_header->value = (char *)malloc(value_len + 1)) < 0)
+    if ((new_header->value = (char *)malloc(value_len + 1)) == NULL)
     {
         throw bad_alloc();
     }
@@ -225,10 +239,13 @@ void http_response::append_header(const char *name, const char *value)
     strcpy(new_header->name, name);
     strcpy(new_header->value, value);
 
-    // Push new header into stack.
-    new_header->next = this->headers;
-
-    this->headers = new_header;
+    // Push new header into queue.
+    if (this->header_queue_tail == NULL)
+    {
+        this->header_queue_tail = new_header;
+    }
+    this->header_queue_head->next = new_header;
+    this->header_queue_head = new_header;
 }
 
 char *http_response::get_reason_phrase(int status)
@@ -255,8 +272,13 @@ char *http_response::get_reason_phrase(int status)
         return "Not Found";
     case 405:
         return "Method Not Allowed";
+    case 501:
+        return "Not Implemented";
+    case 505:
+        return "HTTP Version Not Supported";
+    case 500:
     default:
-        return "Internal Server Error";
+        return "Internal Server Error"; // Last resort.
     }
 }
 
@@ -267,10 +289,6 @@ void http_response::set_status(int status)
 
 void http_response::send_status_line()
 {
-    if (this->status == 0)
-    {
-        throw invalid_argument("Status code not set");
-    }
     if (dprintf(this->socket_fd, "%s %d %s\r\n", this->version, this->status, get_reason_phrase(this->status)) < 0)
     {
         throw runtime_error("Send status line failed");
@@ -278,27 +296,27 @@ void http_response::send_status_line()
 }
 
 // Send header fields and values to socket fd.
-// Headers are stored in stack and sent LIFO.
-// Doesn't do anything if stack is empty.
+// Headers are stored in queue and sent FIFO.
+// Doesn't do anything if queue is empty.
 void http_response::send_headers()
 {
     http_header_t *current = NULL;
-    while (this->headers != NULL)
+    while (this->header_queue_tail != NULL)
     {
         // Check header presence.
-        if (this->headers->name == NULL || this->headers->value == NULL)
+        if (this->header_queue_tail->name == NULL || this->header_queue_tail->value == NULL)
         {
             throw invalid_argument("Invalid header");
         }
         // Send header line.
-        if (dprintf(this->socket_fd, "%s: %s\r\n", this->headers->name, this->headers->value) < 0)
+        if (dprintf(this->socket_fd, "%s: %s\r\n", this->header_queue_tail->name, this->header_queue_tail->value) < 0)
         {
             throw runtime_error("Send header failed");
         }
 
-        // Pop stack.
-        current = this->headers;
-        this->headers = this->headers->next;
+        // Pop queue.
+        current = this->header_queue_tail;
+        this->header_queue_tail = this->header_queue_tail->next;
         free(current);
     }
 }
@@ -311,13 +329,33 @@ void http_response::end_headers()
     }
 }
 
+void http_response::enqueue_general_headers()
+{
+    // Connection.
+    push_header("Connection", "close");
+
+    // Date.
+    // Sun, 06 Nov 1994 08:49:37 GMT
+    ostringstream date_str;
+    time_t now = time(nullptr);
+    tm *gmt = gmtime(&now);
+    date_str << put_time(gmt, "%a, %d %b %Y %H:%M:%S GMT");
+    push_header("Date", date_str.str().c_str());
+}
+
+void http_response::enqueue_server_headers()
+{
+    // Server.
+    push_header("Server", LIBHTTP_HTTP_SERVER_STRING);
+}
+
 // Open fd from this.path and send copy content to socket fd.
 // Only send file content, headers should be handled before invoke.
 // Assuming the path leads to a valid file.
 void http_response::send_file()
 {
     // Get file descriptor.
-    stringstream err_msg;
+    ostringstream err_msg;
     int file_fd = open(this->path, O_RDONLY, S_IRUSR);
     if (file_fd < 0)
     {
@@ -356,7 +394,7 @@ void http_response::send_file()
             if (n_written < 0)
             {
                 err_msg.str("");
-                err_msg << "Error writing to socket: " << this->socket_fd << strerror(errno) << endl;
+                err_msg << "Error writing to socket: " << this->socket_fd << " (" << strerror(errno) << ")" << endl;
                 throw runtime_error(err_msg.str());
             }
             n_buffered -= n_written;
@@ -365,8 +403,17 @@ void http_response::send_file()
     }
 }
 
-void http_response::send_buff(const char *)
+void http_response::send_str()
 {
+    if (this->str == NULL)
+    {
+        throw invalid_argument("Null string pointer");
+    }
+
+    if (dprintf(this->socket_fd, this->str) < 0)
+    {
+        throw runtime_error("Error writing to socket: " + to_string(this->socket_fd) + " (" + strerror(errno) + ")");
+    }
 }
 
 // Copy path to this->path.
@@ -376,18 +423,62 @@ void http_response::set_path(const char *path)
 {
     size_t path_len;
     path_len = strlen(path);
-    if ((this->path = (char *)malloc(path_len + 1)) < 0)
+    if ((this->path = (char *)malloc(path_len + 1)) == NULL)
     {
         throw bad_alloc();
     }
     strcpy(this->path, path);
 }
 
-// Only support sending files and file lists for now.
-// Assumes path is correct in format, and file exists.
-// format: "path/to/file".
-void http_response::send()
+void http_response::set_msg(const string &msg)
 {
+    this->msg = msg;
+}
+
+// Only support sending files and file lists for now.
+// Assumes path is correctly parsed.
+// format: "path/to/file".
+void http_response::serve_file()
+{
+    // Check whether file exists.
+    if (!fs::exists(this->path))
+    {
+        throw invalid_argument("Nonexistent file");
+    }
+    if (!fs::is_regular_file(this->path))
+    {
+        throw invalid_argument("Not regular file");
+    }
+    if (fs::is_directory(this->path))
+    {
+        char *index_path = (char *)malloc(strlen(this->path) + 10);
+        if (fs::exists(index_path))
+        {
+            set_path(index_path);
+            free(index_path);
+            serve_file();
+            return;
+        }
+        else
+        {
+            serve_dir();
+            return;
+        }
+    }
+
+    // Set status code 200 OK.
+    set_status(200);
+
+    // Enqueue headers.
+    enqueue_general_headers();
+    enqueue_server_headers();
+
+    // Enqueue entity headers.
+    size_t size = fs::file_size(this->path);
+    push_header("Content-Length", to_string(size).c_str());
+
+    push_header("Content-Type", http_get_mime_type(fs::path(this->path).extension()).c_str());
+
     try
     {
         send_status_line();
@@ -409,5 +500,184 @@ void http_response::send()
     {
         cerr << "Unknown error caught: " << e.what() << endl;
         throw runtime_error("libhttp: send request failed");
+    }
+}
+
+// Assumes path is correctly parsed.
+void http_response::serve_dir()
+{
+    // Check whether file exists.
+    if (!fs::exists(this->path))
+    {
+        throw invalid_argument("Nonexistent directory");
+    }
+    if (!fs::is_directory(this->path))
+    {
+        throw invalid_argument("Not directory");
+    }
+
+    ostringstream sstr;
+    sstr << "<html>\n";
+    sstr << "<head><title>Index of /" << this->path << "</title></head>\n";
+    sstr << "<body>\n";
+    sstr << "<h1>Index of /" << this->path << "</h1><hr><pre>" << "<a href=\"../\">../</a>\n";
+
+    try
+    {
+        // Open directory and query files.
+        for (const auto &entry : fs::directory_iterator(this->path))
+        {
+            if (entry.path().filename() == ".")
+            {
+                continue;
+            }
+            sstr << http_format_herf(this->path, entry.path().filename()) << "\n";
+        }
+    }
+    catch (const fs::filesystem_error &e)
+    {
+        cerr << "Filesystem error caught: " << this->path << " (" << e.what() << ")" << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+
+    sstr << "</pre><hr></body>\n";
+    sstr << "</html>\n";
+
+    this->str = sstr.str().c_str();
+
+    // Set status 200 OK.
+    set_status(200);
+
+    // Enqueue headers.
+    enqueue_general_headers();
+    enqueue_server_headers();
+
+    // Enqueue entity headers.
+    push_header("Content-Length", to_string(strlen(this->str)).c_str());
+
+    push_header("Content-Type", "text/html");
+
+    try
+    {
+        send_status_line();
+        send_headers();
+        end_headers();
+        send_str();
+    }
+    catch (const runtime_error &e)
+    {
+        cerr << "Runtime error caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+    catch (const invalid_argument &e)
+    {
+        cerr << "Invalid argument caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+    catch (const exception &e)
+    {
+        cerr << "Unknown error caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+}
+
+// Send msg in this->msg.
+// Does not set default status code.
+// Use http_response::set_status() to set status code before invoke.
+void http_response::serve_msg()
+{
+    ostringstream smsg;
+    smsg << "<html>\n";
+    smsg << "<body>\n";
+    smsg << "<p>\n";
+    smsg << this->msg;
+    smsg << "</p>\n";
+    smsg << "</body>\n";
+    smsg << "</html>\n";
+
+    this->str = smsg.str().c_str();
+
+    // Enqueue headers.
+    enqueue_general_headers();
+    enqueue_server_headers();
+
+    // Enqueue entity headers.
+    push_header("Content-Length", to_string(strlen(this->str)).c_str());
+
+    push_header("Content-Type", "text/html");
+
+    try
+    {
+        send_status_line();
+        send_headers();
+        end_headers();
+        if (!this->msg.empty())
+        {
+            send_str();
+        }
+    }
+    catch (const runtime_error &e)
+    {
+        cerr << "Runtime error caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+    catch (const invalid_argument &e)
+    {
+        cerr << "Invalid argument caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+    catch (const exception &e)
+    {
+        cerr << "Unknown error caught: " << e.what() << endl;
+        throw runtime_error("libhttp: send request failed");
+    }
+}
+
+string http_response::http_format_herf(const string &path, const string &filename)
+{
+    return "<a href=\"" + path + "/" + filename + "\">" + filename + "</a>";
+}
+
+string http_response::http_get_mime_type(const string &extension)
+{
+    if (extension.empty())
+    {
+        return "text/plain";
+    }
+    else if (extension == ".txt")
+    {
+        return "text/plain";
+    }
+    else if (extension == ".html")
+    {
+        return "text/html";
+    }
+    else if (extension == ".jpg")
+    {
+        return "image/jpeg";
+    }
+    else if (extension == ".jpeg")
+    {
+        return "image/jpeg";
+    }
+    else if (extension == ".png")
+    {
+        return "image/png";
+    }
+    else if (extension == ".css")
+    {
+        return "text/css";
+    }
+    else if (extension == ".js")
+    {
+        return "application/javascript";
+    }
+    else if (extension == ".jpg")
+    {
+        return "application/pdf";
+    }
+    else
+    {
+        return "text/plain";
     }
 }

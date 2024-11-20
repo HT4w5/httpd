@@ -40,10 +40,86 @@ void error_die(const string &msg)
 
 void *handle_file_request(void *client_fd)
 {
+    int fd = *(int *)client_fd;
     // TODO: Implement file request handling.
-    http_request file_request(*(int *)client_fd);
-    file_request.parse();
+    http_request file_request(fd);
+    http_response file_response(fd);
+    try
+    {
+        file_request.parse();
+    }
+    catch (const invalid_argument &e)
+    {
+        cerr << "Bad HTTP request: " << e.what() << endl;
+        // Bad HTTP request.
+        file_response.set_status(400);
+        file_response.set_msg("");
+        file_response.serve_msg();
+        close(fd);
+        return NULL;
+    }
 
+    if (file_request.version != LIBHTTP_HTTP_VERSION)
+    {
+        file_response.set_status(505);
+        file_response.set_msg("");
+        file_response.serve_msg();
+        close(fd);
+        return NULL;
+    }
+
+    if (file_request.method == "GET")
+    {
+        do
+        {
+            // Parse file path.
+            if (file_request.path[0] != '/')
+            {
+                break;
+            }
+            // Turncate ending slash.
+            int path_len = strlen(file_request.path);
+            if (file_request.path[path_len - 1] == '/')
+            {
+                file_request.path[path_len - 1] = '\0';
+            }
+            file_response.set_path(file_request.path + 1);
+
+            try
+            {
+                file_response.serve_file();
+            }
+            catch (runtime_error &e)
+            {
+                cerr << "Server error caught, sending 500. " << e.what() << endl;
+                file_response.set_status(500);
+                file_response.set_msg("");
+                file_response.serve_msg();
+                close(fd);
+                return NULL;
+            }
+            catch (invalid_argument &e)
+            {
+                break;
+            }
+            return NULL;
+
+        } while (0);
+
+        // Send 404.
+        file_response.set_status(404);
+        file_response.set_msg("");
+        file_response.serve_msg();
+        close(fd);
+        return NULL;
+    }
+
+    // TODO: implement other methods.
+    file_response.set_status(501);
+    file_response.set_msg("");
+    file_response.serve_msg();
+    close(fd);
+    return NULL;
 }
 
 void *handle_proxy_request(void *client_fd)
@@ -123,11 +199,12 @@ int main(int argc, char *argv[])
 {
     void *(*request_handler)(void *) = NULL;
 
+    /*
     // No args specified.
     if (argc == 1)
     {
         print_usage();
-        return 1;
+        return EXIT_FAILURE;
     }
     else if (argv[1] == "-h" || argv[1] == "--help")
     {
@@ -152,13 +229,13 @@ int main(int argc, char *argv[])
             catch (const exception &e)
             {
                 cerr << "Invalid port number." << endl;
-                return 1;
+                return EXIT_FAILURE;
             }
 
             if (server_port < 1 || server_port > 65535)
             {
                 cerr << "Invalid port number." << endl;
-                return 1;
+                return EXIT_FAILURE;
             }
             ++i;
         }
@@ -177,7 +254,7 @@ int main(int argc, char *argv[])
             catch (const exception &e)
             {
                 cerr << "Invalid number of threads." << endl;
-                return 1;
+                return EXIT_FAILURE;
             }
             ++i;
         }
@@ -185,7 +262,7 @@ int main(int argc, char *argv[])
         {
             cerr << "Invalid arguement: " << argv[i] << "\n";
             print_usage();
-            return 1;
+            return EXIT_FAILURE;
         }
     }
 
@@ -193,14 +270,14 @@ int main(int argc, char *argv[])
     if (!server_dir.empty() && !origin_url.empty())
     {
         cerr << "Cannot specify both files and proxy." << endl;
-        return 1;
+        return EXIT_FAILURE;
     }
 
     // No files or proxy specified.
     if (server_dir.empty() && origin_url.empty())
     {
         cerr << "Must specify either files or proxy." << endl;
-        return 1;
+        return EXIT_FAILURE;
     }
 
     if (!server_dir.empty())
@@ -212,7 +289,7 @@ int main(int argc, char *argv[])
         else
         {
             cerr << "Cannot specify both files and proxy." << endl;
-            return 1;
+            return EXIT_FAILURE;
         }
     }
     else
@@ -224,10 +301,21 @@ int main(int argc, char *argv[])
         else
         {
             cerr << "Must specify either files or proxy." << endl;
-            return 1;
+            return EXIT_FAILURE;
         }
     }
+    */
+
+    // Temporary test values:
+    request_handler = handle_file_request;
+    server_dir = "www/";
+    server_port = 8080;
+
+    // Switch cwd.
+    chdir(server_dir.c_str());
 
     // Initialize server.
     int server_fd = server_init(server_port);
+    listen_forever(server_fd, request_handler);
+    return EXIT_SUCCESS;
 }
