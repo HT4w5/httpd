@@ -1,3 +1,12 @@
+/*
+ * @Author: HT4w5 example@example.com
+ * @Date: 2024-12-11 10:48:58
+ * @LastEditors: HT4w5 example@example.com
+ * @LastEditTime: 2024-12-11 11:05:15
+ * @FilePath: /httpd/httpd.cpp
+ * @Description: Simple http server.
+ */
+
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
@@ -20,6 +29,7 @@ int listen(int server_fd, unsigned short port, char opmode);
 void handle_request(int client_fd, char opmode);
 int handle_file_request(int client_fd, char opmode);
 int handle_proxy_request(int client_fd);
+
 
 int main(int argc, char *argv)
 {
